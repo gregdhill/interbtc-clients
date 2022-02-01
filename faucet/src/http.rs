@@ -164,6 +164,7 @@ async fn ensure_funding_allowed(
             account_id,
             free_balance + reserved_balance
         );
+        println!("{:?}", free_balance);
         return Err(Error::AccountBalanceExceedsMaximum);
     }
 

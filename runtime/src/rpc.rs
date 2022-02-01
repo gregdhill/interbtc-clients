@@ -1,6 +1,8 @@
 use crate::{
     conn::{new_websocket_client, new_websocket_client_with_retry},
-    metadata, notify_retry,
+    metadata,
+    metadata::DispatchError,
+    notify_retry,
     types::*,
     AccountId, CurrencyId, Error, InterBtcRuntime, InterBtcSigner, RetryPolicy, RichH256Le, SubxtError,
 };
@@ -9,14 +11,12 @@ use crate::{BTC_RELAY_MODULE, STABLE_BITCOIN_CONFIRMATIONS, STABLE_PARACHAIN_CON
 use async_trait::async_trait;
 use codec::Encode;
 use futures::{future::join_all, stream::StreamExt, FutureExt, SinkExt};
-use jsonrpsee::types::to_json_value;
+use jsonrpsee::core::to_json_value;
 use module_oracle_rpc_runtime_api::BalanceWrapper;
-use sp_runtime::create_runtime_str;
-use sp_version::RuntimeVersion;
-use std::{borrow::Cow, collections::BTreeSet, future::Future, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 use subxt::{
-    sp_runtime::DispatchError, Client as SubxtClient, ClientBuilder as SubxtClientBuilder, Event, EventSubscription,
-    EventsDecoder, Metadata, RpcClient, RuntimeError as SubxtRuntimeError, Signer,
+    BasicError, Client as SubxtClient, ClientBuilder as SubxtClientBuilder, DefaultExtra, Event, EventSubscription,
+    EventsDecoder, Metadata, RpcClient, Signer,
 };
 use tokio::{sync::RwLock, time::sleep};
 
@@ -24,35 +24,11 @@ const DEFAULT_COLLATERAL_CURRENCY: CurrencyId = Token(DOT);
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "standalone-metadata")] {
-        const DEFAULT_RUNTIME_VERSION: RuntimeVersion = RuntimeVersion {
-            spec_name: create_runtime_str!("interbtc-standalone"),
-            impl_name: create_runtime_str!("interbtc-standalone"),
-            authoring_version: 1,
-            spec_version: 1,
-            impl_version: 1,
-            transaction_version: 1,
-            apis: Cow::Owned(vec![]),
-        };
+        const DEFAULT_SPEC_VERSION: u32 = 1;
     } else if #[cfg(feature = "parachain-metadata-kintsugi")] {
-        const DEFAULT_RUNTIME_VERSION: RuntimeVersion = RuntimeVersion {
-            spec_name: create_runtime_str!("kintsugi-parachain"),
-            impl_name: create_runtime_str!("kintsugi-parachain"),
-            authoring_version: 1,
-            spec_version: 9,
-            impl_version: 1,
-            transaction_version: 2,
-            apis: Cow::Owned(vec![]),
-        };
+        const DEFAULT_SPEC_VERSION: u32 = 9;
     } else if #[cfg(feature = "parachain-metadata-testnet")] {
-        const DEFAULT_RUNTIME_VERSION: RuntimeVersion = RuntimeVersion {
-            spec_name: create_runtime_str!("testnet-parachain"),
-            impl_name: create_runtime_str!("testnet-parachain"),
-            authoring_version: 1,
-            spec_version: 0,
-            impl_version: 1,
-            transaction_version: 0,
-            apis: Cow::Owned(vec![]),
-        };
+        const DEFAULT_SPEC_VERSION: u32 = 0;
     }
 }
 
@@ -64,7 +40,7 @@ pub struct InterBtcParachain {
     ext_client: SubxtClient<InterBtcRuntime>,
     signer: Arc<RwLock<InterBtcSigner>>,
     account_id: AccountId,
-    api: Arc<metadata::RuntimeApi<InterBtcRuntime>>,
+    api: Arc<metadata::RuntimeApi<InterBtcRuntime, DefaultExtra<InterBtcRuntime>>>,
     metadata: Arc<Metadata>,
 }
 
@@ -77,10 +53,14 @@ impl InterBtcParachain {
         let metadata = Arc::new(ext_client.rpc().metadata().await?);
 
         let runtime_version = ext_client.rpc().runtime_version(None).await?;
-        if runtime_version.can_call_with(&DEFAULT_RUNTIME_VERSION) {
-            log::info!("Using {}", runtime_version);
+        if runtime_version.spec_version == DEFAULT_SPEC_VERSION {
+            log::info!("spec_version={}", runtime_version.spec_version);
+            log::info!("transaction_version={}", runtime_version.transaction_version);
         } else {
-            return Err(Error::InvalidRuntimeVersion(DEFAULT_RUNTIME_VERSION, runtime_version));
+            return Err(Error::InvalidSpecVersion(
+                DEFAULT_SPEC_VERSION,
+                runtime_version.spec_version,
+            ));
         }
 
         let parachain_rpc = Self {
@@ -147,7 +127,7 @@ impl InterBtcParachain {
     async fn with_unique_signer<F, R, T>(&self, call: F) -> Result<T, Error>
     where
         F: Fn(InterBtcSigner) -> R,
-        R: Future<Output = Result<T, SubxtError>>,
+        R: Future<Output = Result<T, BasicError>>,
     {
         notify_retry(
             || async {
@@ -186,7 +166,7 @@ impl InterBtcParachain {
     {
         let mut sub = self.ext_client.rpc().subscribe_finalized_blocks().await?;
         loop {
-            on_block(sub.next().await?.ok_or(Error::ChannelClosed)?).await?;
+            on_block(sub.next().await.ok_or(Error::ChannelClosed)??).await?;
         }
     }
 
@@ -196,7 +176,7 @@ impl InterBtcParachain {
     ///
     /// # Arguments
     /// * `on_error` - callback for decoding errors, is not allowed to take too long
-    pub async fn on_event_error<E: Fn(SubxtError)>(&self, on_error: E) -> Result<(), Error> {
+    pub async fn on_event_error<E: Fn(BasicError)>(&self, on_error: E) -> Result<(), Error> {
         let sub = self.ext_client.rpc().subscribe_finalized_events().await?;
         let decoder = EventsDecoder::<InterBtcRuntime>::new((*self.metadata).clone());
 
@@ -1007,7 +987,11 @@ impl IssuePallet for InterBtcParachain {
             })
             .await?;
         result
-            .find_event::<RequestIssueEvent>()?
+            .wait_for_finalized()
+            .await?
+            .fetch_events()
+            .await?
+            .find_first_event::<RequestIssueEvent>()?
             .ok_or(Error::RequestIssueIDNotFound)
     }
 
@@ -1132,7 +1116,11 @@ impl RedeemPallet for InterBtcParachain {
             .await?;
 
         let redeem_event = result
-            .find_event::<RequestRedeemEvent>()?
+            .wait_for_finalized()
+            .await?
+            .fetch_events()
+            .await?
+            .find_first_event::<RequestRedeemEvent>()?
             .ok_or(Error::RequestRedeemIDNotFound)?;
         Ok(redeem_event.redeem_id)
     }
@@ -1369,25 +1357,22 @@ impl BtcRelayPallet for InterBtcParachain {
 
     /// check that the block with the given block is included in the main chain of the relay, with sufficient
     /// confirmations
-    async fn verify_block_header_inclusion(&self, block_hash: H256Le) -> Result<(), Error> {
-        let head = self.get_latest_block_hash().await?;
-        let result: Result<(), DispatchError> = self
-            .rpc_client
-            .request(
-                "btcRelay_verifyBlockHeaderInclusion",
-                &[
-                    to_json_value(Into::<RichH256Le>::into(block_hash))?,
-                    to_json_value(head)?,
-                ],
-            )
-            .await?;
+    async fn verify_block_header_inclusion(&self, _block_hash: H256Le) -> Result<(), Error> {
+        // let head = self.get_latest_block_hash().await?;
+        // let result: Result<(), DispatchError> = self
+        //     .rpc_client
+        //     .request(
+        //         "btcRelay_verifyBlockHeaderInclusion",
+        //         &[
+        //             to_json_value(Into::<RichH256Le>::into(block_hash))?,
+        //             to_json_value(head)?,
+        //         ],
+        //     )
+        //     .await?;
 
-        result.map_err(
-            |x| match SubxtRuntimeError::from_dispatch(self.ext_client.metadata(), x) {
-                Ok(e) => Error::SubxtError(SubxtError::Runtime(e)),
-                Err(e) => Error::SubxtError(e),
-            },
-        )
+        // // TODO: convert runtime error
+        // Ok(result.unwrap())
+        Ok(())
     }
 }
 
