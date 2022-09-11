@@ -1,8 +1,7 @@
 #![cfg(feature = "uses-bitcoind")]
 
 use bitcoin::{
-    Auth, BitcoinCore, BitcoinCoreApi, BitcoinCoreBuilder, Error, Network, PartialAddress, Payload, PrivateKey,
-    PUBLIC_KEY_SIZE,
+    Auth, BitcoinCore, BitcoinCoreApi, BitcoinCoreBuilder, Error, Network, Payload, PrivateKey, PUBLIC_KEY_SIZE,
 };
 use regex::Regex;
 use std::env::var;
@@ -23,8 +22,8 @@ async fn should_get_new_address() -> Result<(), Error> {
     btc_rpc.create_or_load_wallet().await?;
 
     let re = Regex::new("^(bcrt1|[13])[a-zA-HJ-NP-Z0-9]{25,39}$").unwrap();
-    let address: Payload = btc_rpc.get_new_address().await?;
-    assert!(re.is_match(&address.encode_str(Network::Regtest)?));
+    let address = btc_rpc.get_new_address().await?;
+    assert!(re.is_match(&address.to_string()?));
 
     Ok(())
 }

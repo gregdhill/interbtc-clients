@@ -5,7 +5,6 @@ mod electrs;
 mod error;
 mod iter;
 
-pub use addr::PartialAddress;
 use async_trait::async_trait;
 use backoff::{backoff::Backoff, future::retry, ExponentialBackoff};
 use bitcoincore_rpc::bitcoin::consensus::encode::serialize_hex;
@@ -124,9 +123,9 @@ pub trait BitcoinCoreApi {
 
     async fn get_block_hash(&self, height: u32) -> Result<BlockHash, Error>;
 
-    async fn get_new_address<A: PartialAddress + Send + 'static>(&self) -> Result<A, Error>;
+    async fn get_new_address(&self) -> Result<Address, Error>;
 
-    async fn get_new_public_key<P: From<[u8; PUBLIC_KEY_SIZE]> + 'static>(&self) -> Result<P, Error>;
+    async fn get_new_public_key(&self) -> Result<PublicKey, Error>;
 
     fn dump_derivation_key<P: Into<[u8; PUBLIC_KEY_SIZE]> + Send + Sync + 'static>(
         &self,
@@ -159,24 +158,19 @@ pub trait BitcoinCoreApi {
         num_confirmations: u32,
     ) -> Result<TransactionMetadata, Error>;
 
-    async fn bump_fee<A: PartialAddress + Send + Sync + 'static>(
-        &self,
-        txid: &Txid,
-        address: A,
-        fee_rate: SatPerVbyte,
-    ) -> Result<Txid, Error>;
+    async fn bump_fee(&self, txid: &Txid, address: Address, fee_rate: SatPerVbyte) -> Result<Txid, Error>;
 
-    async fn create_and_send_transaction<A: PartialAddress + Send + Sync + 'static>(
+    async fn create_and_send_transaction(
         &self,
-        address: A,
+        address: Address,
         sat: u64,
         fee_rate: SatPerVbyte,
         request_id: Option<H256>,
     ) -> Result<Txid, Error>;
 
-    async fn send_to_address<A: PartialAddress + Send + Sync + 'static>(
+    async fn send_to_address(
         &self,
-        address: A,
+        address: Address,
         sat: u64,
         request_id: Option<H256>,
         fee_rate: SatPerVbyte,
@@ -187,10 +181,7 @@ pub trait BitcoinCoreApi {
 
     async fn rescan_blockchain(&self, start_height: usize, end_height: usize) -> Result<(), Error>;
 
-    async fn rescan_electrs_for_addresses<A: PartialAddress + Send + Sync + 'static>(
-        &self,
-        addresses: Vec<A>,
-    ) -> Result<(), Error>;
+    async fn rescan_electrs_for_addresses(&self, addresses: Vec<Address>) -> Result<(), Error>;
 
     fn get_utxo_count(&self) -> Result<usize, Error>;
 
@@ -417,7 +408,7 @@ impl BitcoinCore {
         Ok(self.rpc.call("createrawtransaction", &args)?)
     }
 
-    async fn fund_and_sign_transaction<A: PartialAddress + Send + Sync + 'static>(
+    async fn fund_and_sign_transaction(
         &self,
         fee_rate: SatPerVbyte,
         raw_tx: &str,
@@ -468,14 +459,14 @@ impl BitcoinCore {
     /// * `sat` - number of Satoshis to transfer
     /// * `fee_rate` - fee rate in sat/vbyte
     /// * `request_id` - the issue/redeem/replace id for which this transfer is being made
-    async fn create_transaction<A: PartialAddress + Send + Sync + 'static>(
+    async fn create_transaction(
         &self,
-        address: A,
+        address: Address,
         sat: u64,
         fee_rate: SatPerVbyte,
         request_id: Option<H256>,
     ) -> Result<LockedTransaction, Error> {
-        let recipient = address.encode_str(self.network)?;
+        let recipient = address.to_string();
         let raw_tx = self
             .with_wallet(|| async {
                 // create raw transaction that includes the op_return (if any). If we were to add the op_return
@@ -487,7 +478,7 @@ impl BitcoinCore {
             })
             .await?;
 
-        self.fund_and_sign_transaction::<A>(fee_rate, &raw_tx, &None, &recipient, true)
+        self.fund_and_sign_transaction(fee_rate, &raw_tx, &None, &recipient, true)
             .await
     }
 
@@ -519,10 +510,6 @@ impl BitcoinCore {
         Ok(self
             .rpc
             .generate_to_address(1, &self.rpc.get_new_address(None, Some(AddressType::Bech32))?)?[0])
-    }
-
-    pub fn encode_address<A: PartialAddress + Send + 'static>(&self, address: A) -> Result<String, Error> {
-        Ok(address.encode_str(self.network)?)
     }
 
     async fn with_wallet<F, R, T>(&self, call: F) -> Result<T, Error>
@@ -701,19 +688,18 @@ impl BitcoinCoreApi for BitcoinCore {
     }
 
     /// Gets a new address from the wallet
-    async fn get_new_address<A: PartialAddress + Send + 'static>(&self) -> Result<A, Error> {
-        let address = self.rpc.get_new_address(None, Some(AddressType::Bech32))?;
-        Ok(A::decode_str(&address.to_string())?)
+    async fn get_new_address(&self) -> Result<Address, Error> {
+        Ok(self.rpc.get_new_address(None, Some(AddressType::Bech32))?)
     }
 
     /// Gets a new public key for an address in the wallet
-    async fn get_new_public_key<P: From<[u8; PUBLIC_KEY_SIZE]> + 'static>(&self) -> Result<P, Error> {
+    async fn get_new_public_key(&self) -> Result<PublicKey, Error> {
         let address = self
             .rpc
             .get_new_address(Some(DERIVATION_KEY_LABEL), Some(AddressType::Bech32))?;
         let address_info = self.rpc.get_address_info(&address)?;
         let public_key = address_info.pubkey.ok_or(Error::MissingPublicKey)?;
-        Ok(P::from(public_key.key.serialize()))
+        Ok(public_key)
     }
 
     fn dump_derivation_key<P: Into<[u8; PUBLIC_KEY_SIZE]> + Send + Sync + 'static>(
@@ -839,32 +825,29 @@ impl BitcoinCoreApi for BitcoinCore {
         })
     }
 
-    async fn bump_fee<A: PartialAddress + Send + Sync + 'static>(
-        &self,
-        txid: &Txid,
-        address: A,
-        fee_rate: SatPerVbyte,
-    ) -> Result<Txid, Error> {
+    async fn bump_fee(&self, txid: &Txid, address: Address, fee_rate: SatPerVbyte) -> Result<Txid, Error> {
         let (raw_tx, return_to_self_address) = self
             .with_wallet_inner(false, || async {
                 let mut existing_transaction = self.rpc.get_raw_transaction(txid, None)?;
 
                 let return_to_self = existing_transaction
-                    .extract_return_to_self_address(&address)?
-                    .map(|(idx, x)| {
+                    .extract_return_to_self_address(&address.payload)?
+                    .map(|(idx, payload)| {
                         existing_transaction.output.remove(idx);
-                        x.to_address(self.network)
-                    })
-                    .transpose()?;
+                        Address {
+                            payload,
+                            network: self.network(),
+                        }
+                    });
 
                 let raw_tx = serialize_hex(&existing_transaction);
                 Ok((raw_tx, return_to_self))
             })
             .await?;
 
-        let recipient = address.encode_str(self.network)?;
+        let recipient = address.to_string();
         let tx = self
-            .fund_and_sign_transaction::<A>(fee_rate, &raw_tx, &return_to_self_address, &recipient, false)
+            .fund_and_sign_transaction(fee_rate, &raw_tx, &return_to_self_address, &recipient, false)
             .await?;
 
         let txid = self
@@ -891,9 +874,9 @@ impl BitcoinCoreApi for BitcoinCore {
     /// * `sat` - number of Satoshis to transfer
     /// * `fee_rate` - fee rate in sat/vbyte
     /// * `request_id` - the issue/redeem/replace id for which this transfer is being made
-    async fn create_and_send_transaction<A: PartialAddress + Send + Sync + 'static>(
+    async fn create_and_send_transaction(
         &self,
-        address: A,
+        address: Address,
         sat: u64,
         fee_rate: SatPerVbyte,
         request_id: Option<H256>,
@@ -912,9 +895,9 @@ impl BitcoinCoreApi for BitcoinCore {
     /// * `request_id` - the issue/redeem/replace id for which this transfer is being made
     /// * `fee_rate` - fee rate in sat/vbyte
     /// * `num_confirmations` - how many confirmations we need to wait for
-    async fn send_to_address<A: PartialAddress + Send + Sync + 'static>(
+    async fn send_to_address(
         &self,
-        address: A,
+        address: Address,
         sat: u64,
         request_id: Option<H256>,
         fee_rate: SatPerVbyte,
@@ -950,12 +933,9 @@ impl BitcoinCoreApi for BitcoinCore {
         Ok(())
     }
 
-    async fn rescan_electrs_for_addresses<A: PartialAddress + Send + Sync + 'static>(
-        &self,
-        addresses: Vec<A>,
-    ) -> Result<(), Error> {
+    async fn rescan_electrs_for_addresses(&self, addresses: Vec<Address>) -> Result<(), Error> {
         for address in addresses.into_iter() {
-            let address = address.encode_str(self.network)?;
+            let address = address.to_string();
             let all_transactions = get_address_tx_history_full(&self.electrs_config.base_path, &address).await?;
             // filter to only import
             // a) payments in the blockchain (not in mempool), and
@@ -1028,13 +1008,10 @@ impl BitcoinCoreApi for BitcoinCore {
 pub trait TransactionExt {
     fn get_op_return(&self) -> Option<H256>;
     fn get_op_return_bytes(&self) -> Option<[u8; 34]>;
-    fn get_payment_amount_to<A: PartialAddress + PartialEq>(&self, dest: A) -> Option<u64>;
-    fn extract_output_addresses<A: PartialAddress>(&self) -> Vec<A>;
-    fn extract_indexed_output_addresses<A: PartialAddress>(&self) -> Vec<(usize, A)>;
-    fn extract_return_to_self_address<A: PartialAddress>(
-        &self,
-        destination_address: &A,
-    ) -> Result<Option<(usize, A)>, Error>;
+    fn get_payment_amount_to(&self, dest: Payload) -> Option<u64>;
+    fn extract_output_addresses(&self) -> Vec<Payload>;
+    fn extract_indexed_output_addresses(&self) -> Vec<(usize, Payload)>;
+    fn extract_return_to_self_address(&self, destination: &Payload) -> Result<Option<(usize, Payload)>, Error>;
 }
 
 impl TransactionExt for Transaction {
@@ -1058,11 +1035,10 @@ impl TransactionExt for Transaction {
     }
 
     /// Get the amount of btc that self sent to `dest`, if any
-    fn get_payment_amount_to<A: PartialAddress + PartialEq>(&self, dest: A) -> Option<u64> {
+    fn get_payment_amount_to(&self, dest: Payload) -> Option<u64> {
         self.output.iter().find_map(|uxto| {
             let payload = Payload::from_script(&uxto.script_pubkey)?;
-            let address = A::from_payload(payload).ok()?;
-            if address == dest {
+            if payload == dest {
                 Some(uxto.value)
             } else {
                 None
@@ -1071,8 +1047,8 @@ impl TransactionExt for Transaction {
     }
 
     /// return the addresses that are used as outputs with non-zero value in this transaction
-    fn extract_output_addresses<A: PartialAddress>(&self) -> Vec<A> {
-        self.extract_indexed_output_addresses::<A>()
+    fn extract_output_addresses(&self) -> Vec<Payload> {
+        self.extract_indexed_output_addresses()
             .into_iter()
             .map(|(_idx, val)| val)
             .collect()
@@ -1080,27 +1056,21 @@ impl TransactionExt for Transaction {
 
     /// return the addresses that are used as outputs with non-zero value in this transaction,
     /// together with their index
-    fn extract_indexed_output_addresses<A: PartialAddress>(&self) -> Vec<(usize, A)> {
+    fn extract_indexed_output_addresses(&self) -> Vec<(usize, Payload)> {
         self.output
             .iter()
             .enumerate()
             .filter(|(_, x)| x.value > 0)
-            .filter_map(|(idx, tx_out)| {
-                let payload = Payload::from_script(&tx_out.script_pubkey)?;
-                Some((idx, PartialAddress::from_payload(payload).ok()?))
-            })
+            .filter_map(|(idx, tx_out)| Some((idx, Payload::from_script(&tx_out.script_pubkey)?)))
             .collect()
     }
 
     /// return index and address of the return-to-self (or None if it does not exist)
-    fn extract_return_to_self_address<A: PartialAddress>(
-        &self,
-        destination_address: &A,
-    ) -> Result<Option<(usize, A)>, Error> {
+    fn extract_return_to_self_address(&self, destination: &Payload) -> Result<Option<(usize, Payload)>, Error> {
         let mut return_to_self_addresses = self
             .extract_indexed_output_addresses()
             .into_iter()
-            .filter(|(_idx, x)| x != destination_address)
+            .filter(|(_idx, x)| x != destination)
             .collect::<Vec<_>>();
 
         // register return-to-self address if it exists
@@ -1116,7 +1086,7 @@ impl TransactionExt for Transaction {
 mod tests {
     use super::*;
 
-    use bitcoincore_rpc::bitcoin::{hashes::hex::FromHex, OutPoint, Script, Transaction};
+    use bitcoincore_rpc::bitcoin::hashes::hex::FromHex;
 
     async fn test_electrs(url: &str, script_hex: &str, expected_txid: &str) {
         let config = ElectrsConfiguration {

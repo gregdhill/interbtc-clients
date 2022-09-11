@@ -755,8 +755,10 @@ impl VaultService {
 
         if self.btc_parachain.get_public_key().await?.is_none() {
             tracing::info!("Registering bitcoin public key to the parachain...");
-            let new_key = self.btc_rpc_master_wallet.get_new_public_key().await?;
-            self.btc_parachain.register_public_key(new_key).await?;
+            let public_key = self.btc_rpc_master_wallet.get_new_public_key().await?;
+            self.btc_parachain
+                .register_public_key(public_key.key.serialize().into())
+                .await?;
         }
 
         Ok(())

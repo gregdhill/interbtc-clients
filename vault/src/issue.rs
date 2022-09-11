@@ -5,7 +5,7 @@ use bitcoin::{BitcoinCoreApi, BlockHash, Transaction, TransactionExt};
 use futures::{channel::mpsc::Sender, future, SinkExt, StreamExt, TryFutureExt};
 use runtime::{
     BtcAddress, BtcPublicKey, BtcRelayPallet, CancelIssueEvent, ExecuteIssueEvent, H256Le, InterBtcParachain,
-    IssuePallet, IssueRequestStatus, PrettyPrint, RequestIssueEvent, UtilFuncs, VaultId, H256,
+    IssuePallet, IssueRequestStatus, PartialAddress, PrettyPrint, RequestIssueEvent, UtilFuncs, VaultId, H256,
 };
 use service::Error as ServiceError;
 use sha2::{Digest, Sha256};
@@ -125,7 +125,7 @@ pub async fn add_keys_from_past_issue_request<B: BitcoinCoreApi + Clone + Send +
                     .into_iter()
                     .filter_map(|(_, request)| {
                         if (request.btc_height as usize) < btc_pruned_start_height {
-                            Some(request.btc_address)
+                            Some(request.btc_address.to_address(bitcoin_core.network()).ok()?)
                         } else {
                             None
                         }
@@ -155,15 +155,24 @@ async fn process_transaction_and_execute_issue<B: BitcoinCoreApi + Clone + Send 
     transaction: Transaction,
     random_delay: Arc<Box<dyn RandomDelay + Send + Sync>>,
 ) -> Result<(), Error> {
-    let addresses = transaction.extract_output_addresses::<BtcAddress>();
+    let addresses: Vec<BtcAddress> = transaction
+        .extract_output_addresses()
+        .into_iter()
+        .filter_map(|payload| BtcAddress::from_payload(payload).ok())
+        .collect();
     let mut issue_requests = issue_set.lock().await;
     if let Some((issue_id, address)) = addresses.iter().find_map(|address| {
         let issue_id = issue_requests.get_key_for_value(address)?;
         Some((*issue_id, *address))
     }) {
         let issue = btc_parachain.get_issue_request(issue_id).await?;
+        let payload = if let Ok(payload) = address.to_payload() {
+            payload
+        } else {
+            return Ok(());
+        };
         // tx has output to address
-        match transaction.get_payment_amount_to(address) {
+        match transaction.get_payment_amount_to(payload) {
             None => {
                 // this should never happen, so use WARN
                 tracing::warn!(
