@@ -213,7 +213,7 @@ pub trait BitcoinCoreApi {
         num_confirmations: u32,
     ) -> Result<TransactionMetadata, Error>;
 
-    async fn sweep_funds(&self, address: Address) -> Result<Txid, Error>;
+    async fn sweep_funds(&self, address: Address) -> Result<(), Error>;
 
     async fn create_or_load_wallet(&self) -> Result<(), Error>;
 
@@ -1063,7 +1063,7 @@ impl BitcoinCoreApi for BitcoinCore {
             .await?)
     }
 
-    async fn sweep_funds(&self, address: Address) -> Result<Txid, Error> {
+    async fn sweep_funds(&self, address: Address) -> Result<(), Error> {
         let unspent = self.rpc.list_unspent(None, None, None, None, None)?;
 
         let mut amount = Amount::ZERO;
@@ -1117,7 +1117,16 @@ impl BitcoinCoreApi for BitcoinCore {
         }
 
         let transaction = signed_funded_raw_tx.transaction()?;
-        self.rpc.send_raw_transaction(&transaction).map_err(Into::into)
+        match self.rpc.send_raw_transaction(&transaction) {
+            Ok(txid) => {
+                log::info!("Sent sweep tx: {txid}");
+            }
+            Err(err) => {
+                log::error!("Could not sweep funds: {err}");
+            }
+        }
+
+        Ok(())
     }
 
     /// Create or load a wallet on Bitcoin Core.
